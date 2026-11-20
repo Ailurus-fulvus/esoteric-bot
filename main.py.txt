@@ -1,0 +1,192 @@
+import asyncio
+import logging
+import random
+import os
+from datetime import datetime, timezone, timedelta
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramForbiddenError
+import aiosqlite
+
+# ================= НАСТРОЙКИ (Берутся из переменных окружения Koyeb) =================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+MSK_TZ = timezone(timedelta(hours=3))
+
+MESSAGES_POOL = [
+    "✨ Вселенная слышит тебя. Сегодня отличный день, чтобы отпустить старые обиды и сделать шаг навстречу новому.",
+    "🌙 Твоя интуиция сейчас обострена как никогда. Прислушайся к первому чувству, которое придет после прочтения этого сообщения.",
+    "🔮 Не бойся перемен. То, что кажется концом, на самом деле является началом твоего истинного пути.",
+    "🌟 Энергия изобилия уже направляется к тебе. Открой ей дверь, сказав 'да' новым возможностям на этой неделе.",
+    "🕊️ Тишина внутри тебя — это ответ на все вопросы. Найди 5 минут сегодня, чтобы просто помолчать и подышать."
+]
+
+STATS_FILE = "stats.txt"
+
+# ================= ИНИЦИАЛИЗАЦИЯ =================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+kb = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="✨ Получить послание", callback_data="get_message")]
+])
+
+# ================= БАЗА ДАННЫХ (SQLite) =================
+async def init_db():
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
+        await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (ADMIN_ID,))
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                last_msg_date TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_history (
+                user_id INTEGER,
+                msg_index INTEGER,
+                PRIMARY KEY (user_id, msg_index)
+            )
+        """)
+        await db.commit()
+
+async def get_msk_date():
+    return datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+
+def log_to_file(user_id, username, msg_index):
+    now = datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with open(STATS_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{now}] User: {user_id} (@{username}) | Получил послание №{msg_index}\n")
+
+# ================= ОБРАБОТЧИКИ =================
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, last_msg_date) VALUES (?, ?, ?)",
+            (message.from_user.id, message.from_user.username, "1970-01-01")
+        )
+        await db.commit()
+    
+    await message.answer(
+        f"Привет, {message.from_user.first_name}! 🌿\n\n"
+        "Я помогу тебе получить послание от вселенной. "
+        "Нажми на кнопку ниже, когда будешь готов.",
+        reply_markup=kb
+    )
+
+@dp.callback_query(F.data == "get_message")
+async def process_get_message(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    username = callback.from_user.username or "unknown"
+    today = await get_msk_date()
+
+    async with aiosqlite.connect("bot.db") as db:
+        cursor = await db.execute("SELECT last_msg_date FROM users WHERE user_id = ?", (user_id,))
+        result = await cursor.fetchone()
+        last_date = result[0] if result else "1970-01-01"
+
+        if last_date == today:
+            await callback.answer("🌙 Вы уже получали послание сегодня. Возвращайтесь завтра!", show_alert=True)
+            return
+
+        cursor = await db.execute("SELECT msg_index FROM user_history WHERE user_id = ?", (user_id,))
+        history = [row[0] for row in await cursor.fetchall()]
+        
+        available_indices = [i for i in range(len(MESSAGES_POOL)) if i not in history]
+        
+        if not available_indices:
+            await db.execute("DELETE FROM user_history WHERE user_id = ?", (user_id,))
+            available_indices = list(range(len(MESSAGES_POOL)))
+
+        chosen_index = random.choice(available_indices)
+        message_text = MESSAGES_POOL[chosen_index]
+
+        await db.execute("UPDATE users SET last_msg_date = ? WHERE user_id = ?", (today, user_id))
+        await db.execute("INSERT INTO user_history (user_id, msg_index) VALUES (?, ?)", (user_id, chosen_index))
+        await db.commit()
+
+    log_to_file(user_id, username, chosen_index)
+    await callback.message.answer(f"🔮 Твое послание:\n\n_{message_text}_", parse_mode="Markdown")
+    await callback.answer()
+
+@dp.message(Command("add_admin"))
+async def cmd_add_admin(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        async with aiosqlite.connect("bot.db") as db:
+            cursor = await db.execute("SELECT 1 FROM admins WHERE user_id = ?", (message.from_user.id,))
+            if not await cursor.fetchone():
+                return
+    try:
+        new_admin_id = int(message.text.split()[1])
+    except (IndexError, ValueError):
+        await message.answer("Использование: `/add_admin <user_id>`", parse_mode="Markdown")
+        return
+
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (new_admin_id,))
+        await db.commit()
+    await message.answer(f"✅ Пользователь с ID `{new_admin_id}` добавлен в админ-панель.", parse_mode="Markdown")
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message):
+    async with aiosqlite.connect("bot.db") as db:
+        cursor = await db.execute("SELECT 1 FROM admins WHERE user_id = ?", (message.from_user.id,))
+        if not await cursor.fetchone():
+            return
+
+    text_to_send = message.text.replace("/broadcast", "").strip()
+    if not text_to_send:
+        await message.answer("Введите текст для рассылки после команды /broadcast")
+        return
+
+    await message.answer("⏳ Начинаю рассылку...")
+    async with aiosqlite.connect("bot.db") as db:
+        cursor = await db.execute("SELECT user_id FROM users")
+        users = [row[0] for row in await cursor.fetchall()]
+
+    success_count = 0
+    blocked_count = 0
+    for uid in users:
+        try:
+            await bot.send_message(uid, text_to_send)
+            success_count += 1
+            await asyncio.sleep(0.05)
+        except TelegramForbiddenError:
+            blocked_count += 1
+        except Exception as e:
+            logging.error(f"Ошибка отправки пользователю {uid}: {e}")
+
+    await message.answer(f"✅ Рассылка завершена!\nДоставлено: {success_count}\nЗаблокировали бота: {blocked_count}")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    async with aiosqlite.connect("bot.db") as db:
+        cursor = await db.execute("SELECT 1 FROM admins WHERE user_id = ?", (message.from_user.id,))
+        if not await cursor.fetchone():
+            return
+    if os.path.exists(STATS_FILE):
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-20:]
+            await message.answer("📊 Последние записи в статистике:\n\n" + "".join(lines))
+    else:
+        await message.answer("Файл статистики пока пуст.")
+
+# ================= ЗАПУСК =================
+async def main():
+    await init_db()
+    logging.info("Бот запущен и готов к работе!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Бот остановлен вручную.")
